@@ -221,5 +221,5 @@ def test_full_pipeline(pdf_path: str):
 
 
 if __name__ == "__main__":
-    pdf_path = "data/pdf_file/pdf/LS.pdf"
+    pdf_path = "data/pdf_file/pdf/1.CSE.pdf"
     test_full_pipeline(pdf_path)
