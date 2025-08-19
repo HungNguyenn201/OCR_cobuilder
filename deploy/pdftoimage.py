@@ -28,7 +28,7 @@ def convert_pdf_to_images(pdf_path: str, base_output_dir: str = "cache/images") 
     output_folder = os.path.join(base_output_dir, pdf_name)
     os.makedirs(output_folder, exist_ok=True)
 
-    images = convert_from_path(pdf_path, dpi=300, poppler_path=POPPLER_PATH)
+    images = convert_from_path(pdf_path, dpi=400, poppler_path=POPPLER_PATH)
     result = {"images": []}
 
     for i, img in enumerate(images):

@@ -2,22 +2,25 @@ from __future__ import annotations
 from typing import List, Dict, Any, Tuple
 import json
 import cv2
-
-from pipeline import OCRPipeline
+from pipeline import OCRPipeline, get_shared_engine_pool
 from text_extract_pdf import add_missing_from_pdf, try_load_pdf_text_for_image
-from header import (PIPELINE_DEBUG, PDF_VALIDATE_DEFAULT, 
-                    PDF_IOU_THRESH)
+from header import (
+    PIPELINE_DEBUG,
+    PDF_VALIDATE_DEFAULT,
+    PDF_IOU_THRESH,
+)
 
 def _read_image_size(path: str) -> Tuple[int, int]:
-    img = cv2.imread(path)
+    img = cv2.imread(path, cv2.IMREAD_COLOR)
     if img is None:
         raise FileNotFoundError(path)
     return (img.shape[1], img.shape[0])  # (w, h)
 
-
-def run_batch_ocr_from_cache(cache_json_path: str,
-                              use_pdf_validate: bool | None = None,
-                             iou_thresh: float | None = None) -> List[Dict[str, Any]]:
+def run_batch_ocr_from_cache(
+    cache_json_path: str,
+    use_pdf_validate: bool | None = None,
+    iou_thresh: float | None = None
+) -> List[Dict[str, Any]]:
     """
     Chạy OCR theo danh sách ảnh trong cache.json:
       1) OCRPipeline.run()
@@ -36,15 +39,18 @@ def run_batch_ocr_from_cache(cache_json_path: str,
     img_entries = data.get("images", []) or []
     all_results: List[Dict[str, Any]] = []
 
+    # Khởi tạo shared engine pool MỘT LẦN cho toàn bộ batch (giảm RAM & thời gian warmup)
+    pool = get_shared_engine_pool()
+
     for entry in img_entries:
         img_id = entry["id"]
         img_path = entry["path"]
         if PIPELINE_DEBUG:
             print(f"[INFO] Processing img id={img_id}, path={img_path}")
 
-        # 1) Run OCR pipeline (dùng phiên bản đã refactor)
-        pipeline = OCRPipeline(image_path=img_path)
-        result = pipeline.run() 
+        # 1) Run OCR pipeline (dùng pool chia sẻ)
+        pipeline = OCRPipeline(image_path=img_path, engine_pool=pool)
+        result = pipeline.run()
 
         # 2) (Tuỳ chọn) Append-only với PDF words
         if use_pdf_validate:
@@ -70,11 +76,13 @@ def run_batch_ocr_from_cache(cache_json_path: str,
 
     return all_results
 
-
-def run_full_ocr_pipeline_from_cache(cache_path: str,
-                                     use_pdf_validate: bool | None = None,
-                                     iou_thresh: float | None = None) -> List[Dict[str, Any]]:
-
-    return run_batch_ocr_from_cache(cache_path, 
-                                    use_pdf_validate=use_pdf_validate, 
-                                    iou_thresh=iou_thresh)
+def run_full_ocr_pipeline_from_cache(
+    cache_path: str,
+    use_pdf_validate: bool | None = None,
+    iou_thresh: float | None = None
+) -> List[Dict[str, Any]]:
+    return run_batch_ocr_from_cache(
+        cache_path,
+        use_pdf_validate=use_pdf_validate,
+        iou_thresh=iou_thresh
+    )

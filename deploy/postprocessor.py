@@ -1,19 +1,27 @@
+# postprocessor.py (updated)
 from __future__ import annotations
 from typing import List, Tuple, Dict, Any, Optional, Union
 import math, re, unicodedata
 from difflib import SequenceMatcher
 import numpy as np
+
 from header import (
+    # NMS / merge / dedupe
     IOU_NMS, CENTER_THRESH_PX, GRID_MULTIPLIER,
     LINE_VOV_THRESH, SMALL_GAP_FACTOR, CHAR_GAP_FACTOR,
     IOU_DEDUP, SIM_DEDUP, VOV_DUP_THRESH, SIM_SHORT, SIM_LONG,
     TILE_MARGIN_PX, OUTER_BORDER_PX,
+
+    # domain regex & rules
     DEVICE_PAT, DEVICE_HEAD_PAT, SEL_SERIES_RE, DS_ES_ALLOWED,
     VOLTAGE_DIGIT_MAP, CUT_JOIN_BONUS_FACTOR, DS_ES_LIKE,
     CB_LIKE_RE, NUM_SHORT_RE, DEV_HEAD_RE, ALNUM, DEVICE_VOLTAGE_PAT,
     HEADER_VOLTAGE_PAT, DS_ES_FULL_RE, DS_ES_WITH_NEAR_NUM_L, DS_ES_WITH_NEAR_NUM_R,
-    REVERSE_VOLTAGE_MAP
-)   
+    REVERSE_VOLTAGE_MAP, HEADER_VOLTAGE_PAT_EN,
+
+    # density mode (E)
+    DENSE_PAGE_MODE, IOU_NMS_DENSE,
+)
 
 # =============================== geometry ===============================
 def _to_int_box(b): x0,y0,x1,y1=b; return (int(round(x0)),int(round(y0)),int(round(x1)),int(round(y1)))
@@ -41,8 +49,6 @@ def _min_nonneg_gap(a,b)->float:
     return min(cand) if cand else -1.0
 
 # =============================== text utils ===============================
-
-
 def _norm_space(s: str) -> str:
     return re.sub(r"\s+", " ", s or "").strip()
 
@@ -102,15 +108,38 @@ def _is_pure_short_num(s: str) -> bool:
     return bool(NUM_SHORT_RE.fullmatch(cs))
 
 def _is_device_like(s: str) -> bool:
+    """Thiết bị/đầu mục: DS/ES (đúng), DS/ES dạng đầy đủ, hoặc header token."""
     up = _norm_space(s).upper()
     comp = re.sub(r"[^A-Z0-9]", "", up)
-    # DS/ES fullmatch theo header + nhóm thiết bị đầu dòng
-    return bool(DS_ES_ALLOWED.fullmatch(comp) or DEV_HEAD_RE.fullmatch(up))
+    return bool(DS_ES_ALLOWED.fullmatch(comp) or DS_ES_FULL_RE.fullmatch(comp) or DEV_HEAD_RE.fullmatch(up))
 
+def _sanitize_device_near_number(text: str) -> str:
+    """
+    Nếu chuỗi là dạng 'DS9 4' hoặc '4 DS9' (DS/ES cạnh số ngắn),
+    trả về 'DS9'/'ES9'… để loại số lẻ dính cạnh. Ngược lại trả nguyên văn.
+    Dùng chung với _canonicalize_device_token để làm sạch token thiết bị.
+    """
+    s = _norm_space(text).upper()
+
+    # Case đặc thù: 'ES1 0', 'DS2 0' (số 0 nhiễu trong CÙNG item) -> cắt bỏ '0'
+    m = re.fullmatch(r'\s*((?:DS|ES)[1-9]{1,2})\s+0+\s*', s, re.I)
+    if m:
+        return m.group(1)
+
+    # Giữ các rule cũ
+    m = DS_ES_WITH_NEAR_NUM_R.fullmatch(s)
+    if m:  # 'DS9 4' (không ghép), trả phần cơ sở
+        return m.group(1)
+    m = DS_ES_WITH_NEAR_NUM_L.fullmatch(s)
+    if m:  # '4 DS9'
+        return m.group(2)
+    return text
+
+# =========================== smart join guard ===========================
 def _should_join_strict(cur: Dict[str,Any], nxt: Dict[str,Any], avg_h: float) -> bool:
     """Chỉ cho phép nối khi có bằng chứng mạnh; chặn 'DS/ES' dính số lẻ."""
     a, b = (cur["text"] or "").strip(), (nxt["text"] or "").strip()
-    if not a or not b: 
+    if not a or not b:
         return False
     # 0) không nối nếu gần như trùng hoặc nối tạo chuỗi lặp
     if _almost_same(a, b) or _looks_like_repeat_concat(a, b):
@@ -128,24 +157,31 @@ def _should_join_strict(cur: Dict[str,Any], nxt: Dict[str,Any], avg_h: float) ->
     if (_is_pure_short_num(a) and _is_device_like(b)) or (_is_pure_short_num(b) and _is_device_like(a)):
         return False
 
-    # 2) cầu nối '-' hoặc '.' (như cũ)
+    # 2) cầu nối '-' hoặc '.'
     if (a.endswith('-') and gap < 0.5*avg_h + cut_bonus) or (b.startswith('-') and gap < 0.5*avg_h + cut_bonus):
         return True
     if ((a.endswith('.') and b[:1].isdigit()) or (a[-1:].isalnum() and b.startswith('.'))) and gap < 0.35*avg_h + cut_bonus:
         return True
 
-    # 3) overlap-x: BẮT BUỘC căn baseline + vov cao + mức chồng vừa
-    #    (tránh trường hợp số “4” lệch hàng nhưng đè trục X với DS9)
+    # 3) overlap-x: yêu cầu căn baseline + vov cao + mức chồng vừa
     if overlap_x:
         if (vov >= 0.60 and base_diff <= 0.30*avg_h and abs(gap) <= 0.25*_avg_h(cur["bbox"], nxt["bbox"])):
             return True
         return False
+
     # 4) substring thật + khoảng cách rất nhỏ
     if vov >= 0.60 and gap <= (0.20*avg_h + cut_bonus):
         if a in b or b in a:
             return True
 
-    # 5) mặc định: không nối (loại hẳn DS9 + 4)
+    # 5) NỚI RIÊNG cho seam: cả hai cùng bị cắt ở rãnh tile → nới điều kiện
+    cur_tags = set(cur.get("tags", [])); nxt_tags = set(nxt.get("tags", []))
+    if ("cut_boundary" in cur_tags) and ("cut_boundary" in nxt_tags):
+        if base_diff <= 0.35*avg_h and abs(gap) <= 0.30*avg_h:
+            if not ((_is_pure_short_num(a) and _is_device_like(b)) or (_is_pure_short_num(b) and _is_device_like(a))):
+                return True
+
+    # 6) mặc định: không nối (loại hẳn DS9 + 4)
     return False
 
 # =========================== tile-edge heuristic ===========================
@@ -185,45 +221,72 @@ def _normalize_sel_series(text: str) -> str:
         return "SEL-" + s
     return SEL_SERIES_RE.sub(_fix, text)
 
+def _clean_digits_no_zero(num: str) -> Optional[str]:
+    """Bỏ tất cả '0'. Hợp lệ khi còn lại 1–3 chữ số (1–9)."""
+    if not num:
+        return None
+    nz = ''.join(ch for ch in num if ch != '0')
+    if re.fullmatch(r'[1-9]{1,3}', nz or ''):
+        return nz
+    return None
+
 def _canonicalize_device_token(text: str) -> str:
     """
     Chuẩn hoá 1 token ngắn theo các luật:
-      - DS/ES đúng chuẩn: DS, ES, DS[1-9], DS[1-9]{2} (không chữ số 0). Hợp lệ -> trả về dạng chuẩn hóa (UPPER).
-      - DS/ES 'na ná' nhưng sai (có 0, ký tự lạ, v.v.) -> trả "" để bị filter.
-      - Mẫu ghép cạnh số ngắn: 'DS9 4' hoặc '4 DS9' -> trả 'DS9'.
+      - DS/ES đúng chuẩn: DS, ES, DS[1-9], DS[1-9]{2} (không chữ số 0 đầu).
+      - Kéo DS/ES xuất hiện 'bên trong' chuỗi (có rác hai đầu) về token sạch, ví dụ: 'r +eS11' -> 'ES11'.
+      - Mẫu ghép cạnh số ngắn: 'DS9 4' hoặc '4 DS9' -> 'DS9'.
       - CB đứng một mình: sửa các biến thể OCR phổ biến (CE, C8, GB) -> 'CB'.
-      - Nếu không rơi vào các trường hợp trên -> trả nguyên văn.
+      - DS/ES 'na ná' nhưng sai (dính rác mà không trích được token hợp lệ) -> trả "" để bị filter.
+      - Không rơi vào các trường hợp trên -> trả nguyên văn.
     """
     if not text:
         return text
-    s = _norm_space(text).upper()
-    s_comp = re.sub(r"[^A-Z0-9]", "", s)
-    # --- 1) 'DS/ES <n>' ghép cạnh số ngắn (hoặc ngược lại) -> chỉ lấy phần DS/ES<n> ---
-    m = DS_ES_WITH_NEAR_NUM_R.fullmatch(s)  # 'DS9 4'
+
+    s = _norm_space(text)
+    su = s.upper()
+    s_comp = re.sub(r"[^A-Z0-9]", "", su)
+
+    # 0) 'DS9 4' hoặc '4 DS9' -> lấy phần DS/ES<n>
+    m = DS_ES_WITH_NEAR_NUM_R.fullmatch(su)  # ví dụ 'DS9 4'
     if m:
         return m.group(1)
-    m = DS_ES_WITH_NEAR_NUM_L.fullmatch(s)  # '4 DS9'
+    m = DS_ES_WITH_NEAR_NUM_L.fullmatch(su)  # ví dụ '4 DS9'
     if m:
         return m.group(1)
-    # --- 2) DS/ES hợp lệ tuyệt đối ---
-    m_ok = DS_ES_ALLOWED.fullmatch(s_comp)  # ^(?:DS|ES)(?:[1-9]{1,2})?$
+
+    # 1) DS/ES hợp lệ tuyệt đối (không số 0 đứng đầu)
+    m_ok = DS_ES_ALLOWED.fullmatch(s_comp)   # ^(?:DS|ES)(?:[1-9]{1,2})?$
     if m_ok:
-        # group(0) đã đúng định dạng; trả nguyên cho nhất quán
-        return m_ok.group(0).upper()
-    # --- 3) DS/ES gần giống nhưng sai -> loại bỏ luôn ---
-    if DS_ES_LIKE.fullmatch(s_comp):        # ^(?:DS|ES)[A-Z0-9]+$
-        # ví dụ DS0, DS20, DS2A, ES01 ...
+        return m_ok.group(0)
+
+    # 1b) TÌM DS/ES NẰM TRONG CHUỖI (loại rác hai đầu). Ví dụ: 'r +eS11' -> 'ES11'
+    m = re.search(r'(?:^|[^A-Z0-9])(DS|ES)\s*([0-9]{1,3})?(?:[^A-Z0-9]|$)', su)
+    m = re.search(r'(?:^|[^A-Z0-9])(DS|ES)\s*([0-9]{1,3})?(?:[^A-Z0-9]|$)', su)
+    if m:
+        head, num = m.group(1), m.group(2)
+        if not num:
+            return head  # 'DS' / 'ES' đơn
+        num_clean = _clean_digits_no_zero(num)   # <-- bỏ '0' nhiễu
+        if num_clean:
+            return f"{head}{num_clean}"
+        return "" 
+
+    # 2) DS/ES giống mà sai -> loại bỏ (để không lẫn với token sạch)
+    if ("DS" in s_comp or "ES" in s_comp):
         return ""
-    # --- 4) CB 2 ký tự đứng 1 mình: sửa các biến thể OCR hay gặp ---
-    # Chỉ can thiệp khi đúng 2 ký tự (không dính thêm số/chuỗi)
+
+    # 3) CB 2 ký tự đứng 1 mình: sửa các biến thể OCR hay gặp
     if len(s_comp) == 2:
         if s_comp == "CB":
             return "CB"
         # Biến thể OCR thường gặp: CE / C8 / GB
-        if CB_LIKE_RE.fullmatch(s_comp):   # ^(?:C|G)(?:B|8|E)$
+        if CB_LIKE_RE.fullmatch(s_comp):    # ^(?:C|G)(?:B|8|E)$
             return "CB"
-    # --- 5) Không matches gì: giữ nguyên ---
+
+    # 4) Không matches gì: giữ nguyên văn bản gốc
     return text
+
 
 # =========================== smart join for drawings ===========================
 def _join_text(a_txt: str, b_txt: str, gap: int, avg_h: float) -> str:
@@ -245,7 +308,7 @@ def _join_text(a_txt: str, b_txt: str, gap: int, avg_h: float) -> str:
 def advanced_nms_text(
     items: List[Dict[str, Any]],
     iou_thresh: float = IOU_NMS,
-    center_thresh: int = CENTER_THRESH_PX, 
+    center_thresh: int = CENTER_THRESH_PX,
     tile_size: Optional[Union[int, Tuple[int, int]]] = None,
     img_size: Optional[Tuple[int, int]] = None,
     stride: Optional[Tuple[int,int]] = None,
@@ -260,6 +323,10 @@ def advanced_nms_text(
       - Nếu dính seam, làm nhẹ hơn (để ghép ở merge)
     """
     if not items: return []
+
+    # relax IoU khi trang dày đặc
+    if DENSE_PAGE_MODE:
+        iou_thresh = min(iou_thresh, IOU_NMS_DENSE)
 
     # chuẩn hoá & auto-tag seam
     std: List[Dict[str, Any]] = []
@@ -368,7 +435,6 @@ def _assign_to_line(lines: List[Dict[str,Any]], it: Dict[str,Any], vov_thresh: f
     else:
         lines.append({"bbox":b,"items":[it],"heights":[_h(b)]})
 
-
 def merge_split_texts(items: List[Dict[str,Any]],
                       line_vov_thresh:float=LINE_VOV_THRESH,
                       gap_factor:float=SMALL_GAP_FACTOR,
@@ -405,7 +471,7 @@ def merge_split_texts(items: List[Dict[str,Any]],
             if not drop:
                 kept_line.append(it)
 
-        # (2) NỐI CHẶT
+        # (2) NỐI CHẶT (seam-aware bằng _should_join_strict)
         out_line: List[Dict[str,Any]] = []
         cur = None
         for it in kept_line:
@@ -414,9 +480,9 @@ def merge_split_texts(items: List[Dict[str,Any]],
 
             if not _should_join_strict(cur, it, avg_h):
                 # không nối → push cur
-                cur["text"] = _canonicalize_device_token(
-                            _normalize_sel_series(cur["text"])
-                        )
+                cur["text"] = _sanitize_device_near_number(
+                 _canonicalize_device_token(_normalize_sel_series(cur["text"]))
+              )
                 out_line.append(cur)
                 cur = dict(it)
                 continue
@@ -433,17 +499,15 @@ def merge_split_texts(items: List[Dict[str,Any]],
                 cur = better
                 continue
 
-            txt = _canonicalize_device_token(
-                _normalize_sel_series(jt)
-)
+            txt = _canonicalize_device_token(_normalize_sel_series(jt))
             cur = {**cur, "text": txt, "bbox": u, "center": _center(u),
                    "confidence": max(float(cur.get("confidence",0)), float(it.get("confidence",0))),
                    "tags": sorted(set(cur.get("tags", [])) | set(it.get("tags", [])))}
 
         if cur is not None:
-            cur["text"] = _canonicalize_device_token(
-                        _normalize_sel_series(cur["text"])
-                    )
+            cur["text"] = _sanitize_device_near_number(
+                 _canonicalize_device_token(_normalize_sel_series(cur["text"]))
+              )
             out_line.append(cur)
 
         merged_all.extend(out_line)
@@ -460,6 +524,7 @@ def remove_duplicate_substrings(items: List[Dict[str,Any]],
     """
     Gỡ các bản sao/substring gần nhau (ưu tiên giữ item dài/chất lượng hơn).
     Seam-aware: nếu có 'cut_boundary', chỉ xoá khi chắc chắn là dup.
+    + Bảo vệ trường hợp KHÁC DÒNG (baseline lệch lớn) không bị xoá nhầm.
     """
     if not items: return []
     items_sorted = sorted(items, key=_text_quality_score, reverse=True)
@@ -472,6 +537,11 @@ def remove_duplicate_substrings(items: List[Dict[str,Any]],
         keep=True
 
         for sel in kept:
+            # NEW: nếu lệch baseline lớn → bỏ qua so sánh dup
+            baseline_diff = abs(it["center"][1] - sel["center"][1])
+            if baseline_diff > 0.5 * _avg_h(it["bbox"], sel["bbox"]):
+                continue
+
             t_sel = _norm_space(sel["text"]); c_sel = _canon(t_sel)
             sel_tags = set(sel.get("tags", []))
             seam_involved = ("cut_boundary" in it_tags) or ("cut_boundary" in sel_tags)
@@ -515,6 +585,8 @@ def is_invalid_fixed_pattern(text: str) -> bool:
 
     comp = re.sub(r"[^A-Z0-9]", "", s.upper())
     # Hợp lệ -> OK; Giống DS/ES nhưng KHÔNG hợp lệ -> loại
+    if ("DS" in comp or "ES" in comp) and not DS_ES_ALLOWED.fullmatch(comp):
+        return True
     if DS_ES_ALLOWED.fullmatch(comp):
         return False
     if DS_ES_LIKE.fullmatch(comp):
@@ -523,45 +595,57 @@ def is_invalid_fixed_pattern(text: str) -> bool:
 
 # ===================== voltage level detector (optional) =====================
 
-def detect_voltage_levels_from_texts(text_list: List[str]) -> List[int]:
-    levels_found = set()
+def _noacc_upper(s: str) -> str:
+    s = unicodedata.normalize("NFD", s or "")
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    s = s.replace("đ","d").replace("Đ","D")
+    return _norm_space(s).upper()
 
-    # priority 1: từ device token sạch
+def detect_voltage_levels_from_texts(text_list: List[str]) -> List[int]:
+    from header import PIPELINE_DEBUG
+    levels_found = set()
+    DBG = bool(PIPELINE_DEBUG)
+    # ---------- priority 1 (UNCHANGED) ----------
     for text in text_list:
-        m = DEVICE_VOLTAGE_PAT.search(text.strip())
+        m = DEVICE_VOLTAGE_PAT.search((text or "").strip())
         if m:
             digit = m.group(2)
             voltage = VOLTAGE_DIGIT_MAP.get(digit)
+            if DBG:
+                print(f"[VOLT:P1] hit='{text}'  match='{m.group(0)}'  digit='{digit}'  -> {voltage}")
             if voltage:
                 levels_found.add(voltage)
-
     if levels_found:
+        if DBG:
+            print(f"[VOLT:FINAL] {sorted(levels_found)}  (source=P1/device_token)")
         return sorted(levels_found)
 
-    # priority 2: từ tiêu đề/header
-    for text in text_list:
-        m = HEADER_VOLTAGE_PAT.search(text or "")
-        if m:
-            try:
-                voltage = int(m.group(2))
-                if str(voltage) in REVERSE_VOLTAGE_MAP:
-                    levels_found.add(voltage)
-            except Exception:
-                pass
+    # ---------- priority 2: header (VN + EN) ----------
+    def _pick_digit(m: re.Match) -> Optional[int]:
+        if not m:
+            return None
+        for g in reversed(m.groups() or []):
+            if g and g.isdigit():
+                try:
+                    return int(g)
+                except Exception:
+                    pass
+        return None
+
+    for raw in text_list:
+        t = _noacc_upper(raw)  # normalize: strip accents, uppercase, collapse spaces
+        m = HEADER_VOLTAGE_PAT.search(t) or HEADER_VOLTAGE_PAT_EN.search(t)
+        v = _pick_digit(m)
+        if DBG and m:
+            src = "VN_HEADER" if m else ("EN_HEADER" if m else "SIDE")
+            print(f"[VOLT:P2:{src}] raw='{raw}'  norm='{t}'  match='{m.group(0)}'  -> {v}")
+        if v is not None and v in REVERSE_VOLTAGE_MAP:  # REVERSE_VOLTAGE_MAP must use int keys
+            levels_found.add(v)
+    if DBG:
+        print(f"[VOLT:FINAL] {sorted(levels_found)}  (source=P2/header)")
     return sorted(levels_found)
 
 
-def _is_device_like(s: str) -> bool:
-    comp = re.sub(r"[^A-Z0-9]", "", _norm_space(s).upper())
-    return bool(DS_ES_ALLOWED.fullmatch(comp) or DS_ES_FULL_RE.fullmatch(comp) or DEV_HEAD_RE.fullmatch(comp))
-
-def _sanitize_device_near_number(text: str) -> str:
-    s = _norm_space(text).upper()
-    m = DS_ES_WITH_NEAR_NUM_R.fullmatch(s)
-    if m: return m.group(1)
-    m = DS_ES_WITH_NEAR_NUM_L.fullmatch(s)
-    if m: return m.group(1)
-    return text
 
 # ================================= exports =================================
 __all__ = [
@@ -572,4 +656,5 @@ __all__ = [
     "is_invalid_fixed_pattern",
     "detect_voltage_levels_from_texts",
     "_iou",
+    "_sanitize_device_near_number"
 ]

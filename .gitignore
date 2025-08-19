@@ -2,7 +2,7 @@ venv/
 cache/
 data/
 outputs/
-deploy/test
+deploy/test.py
 #package
 *.packages
 

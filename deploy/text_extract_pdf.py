@@ -21,7 +21,10 @@ from header import (PDF_CACHE_DIR,  PDF_CENTER_MERGE_PX,
 # ============== Helpers ==============
 def _strip_accents(s: str) -> str:
     s = unicodedata.normalize("NFD", s or "")
-    return "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    s = "".join(ch for ch in s if unicodedata.category(ch) != "Mn")
+    # Chuẩn hoá Đ/đ -> D/d để nhất quán với postprocessor
+    s = s.replace("Đ", "D").replace("đ", "d")
+    return s
 
 def _canon(s: str) -> str:
     s = _strip_accents(s).upper().strip()
@@ -104,10 +107,7 @@ def add_missing_from_pdf(ocr_items, pdf_texts, pdf_size, image_size, iou_thresh=
     def _center(b): x0,y0,x1,y1=b; return (0.5*(x0+x1), 0.5*(y0+y1))
     def _h(b): return max(1.0, b[3]-b[1])
     def _canon_noaccent(s: str) -> str:
-        return re.sub(r"[^A-Z0-9]+","", unicodedata.normalize("NFD", (s or "").upper()).translate(
-            {ord(ch): None for ch in ''.join(c for c in unicodedata.normalize('NFD','Đđ')
-                                             if unicodedata.category(c)=='Mn')}
-        ))
+        return re.sub(r"[^A-Z0-9]+", "", _strip_accents((s or "").upper()))
 
     def _same_text(a: str, b: str) -> bool:
         ca = _canon_noaccent(_normalize_final(a))
@@ -152,6 +152,7 @@ def add_missing_from_pdf(ocr_items, pdf_texts, pdf_size, image_size, iou_thresh=
                 "bbox": mapped_bbox,
                 "confidence": 1.0,
                 "center": [cx, cy],
+                # "tags": ["from_pdf_only"],
             })
             continue
 

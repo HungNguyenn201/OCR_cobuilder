@@ -56,13 +56,13 @@ def visualize_pipeline_debug(
 
         # API mới: trả về (tiles, metas)
         tiles, metas = split_image_to_tiles(
-            img,
-            tile_size=tile_size,
-            overlap_ratio=overlap_ratio,
-            apply_enhance=False,         # chỉ vẽ grid, không cần enhance
-            detect_textual=True,
-            debug_print=PIPELINE_DEBUG
-        )
+                        img,
+                        tile_size=tile_size,
+                        overlap_ratio=overlap_ratio,
+                        apply_enhance=False,   # OK
+                        detect_textual=True,   # OK
+                        debug_print=PIPELINE_DEBUG
+                    )
 
         color_tile = (0, 165, 255)   # cam
         color_core = (0, 255, 0)     # xanh lá
@@ -221,5 +221,5 @@ def test_full_pipeline(pdf_path: str):
 
 
 if __name__ == "__main__":
-    pdf_path = "data/pdf_file/pdf/1.CSE.pdf"
+    pdf_path = "data/pdf_file/pdfs3/BQU_SL.pdf"
     test_full_pipeline(pdf_path)
